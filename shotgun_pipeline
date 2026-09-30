@@ -1,1 +1,716 @@
+#PBS -N qc_raw
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=8:mem=16gb
+#PBS -l walltime=04:00:00
+#PBS -o qc_raw.out
+#PBS -e qc_raw.err
+source ~/.bashrc
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+RAW=${BASE}/fastq_raw
+QC=${BASE}/01_fastqc
+SAMPLES=(M50 M53 M54 M73 M76 M83 M93 M94)
+mkdir -p ${QC}
+
+for s in "${SAMPLES[@]}"; do
+  fastqc -t 8 -o ${QC} \
+    ${RAW}/${s}_1.fastq.gz \
+    ${RAW}/${s}_2.fastq.gz
+done
+
+multiqc ${QC} -o ${QC}/multiqc_report
+echo "[01_qc_raw DONE] $(date)"
+
+#PBS -N fastp_trim
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=16:mem=128gb
+#PBS -l walltime=24:00:00
+#PBS -o fastp_trim.out
+#PBS -e fastp_trim.err
+source ~/.bashrc
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+RAW=${BASE}/fastq_raw
+CLEAN=${BASE}/02_clean
+SAMPLES=(M50 M53 M54 M73 M76 M83 M93 M94)
+mkdir -p ${CLEAN}
+
+ADAPT_NXT_1=CTGTCTCTTATACACATCT
+ADAPT_NXT_2=AGATGTGTATAAGAGACAG
+ADAPT_TRU_1=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+ADAPT_TRU_2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
+
+trim() {  # trim <sample> <adapter_R1> <adapter_R2>
+  local s=$1
+  if [[ -s ${CLEAN}/${s}_clean_1.fastq.gz && -s ${CLEAN}/${s}_clean_2.fastq.gz ]]; then
+    echo "[SKIP] ${s}: trimmed reads exist"
+    return 0
+  fi
+  echo "[fastp] ${s} $(date)"
+  fastp \
+    -i ${RAW}/${s}_1.fastq.gz \
+    -I ${RAW}/${s}_2.fastq.gz \
+    -o ${CLEAN}/${s}_clean_1.fastq.gz \
+    -O ${CLEAN}/${s}_clean_2.fastq.gz \
+    --adapter_sequence $2 \
+    --adapter_sequence_r2 $3 \
+    -q 20 -u 30 -n 5 -l 50 \
+    --thread 16 \
+    --html ${CLEAN}/${s}.fastp.html \
+    --json ${CLEAN}/${s}.fastp.json
+}
+
+for s in M50 M53 M54 M76 M83 M93 M94; do
+  trim ${s} ${ADAPT_NXT_1} ${ADAPT_NXT_2}
+done
+
+trim M73 ${ADAPT_TRU_1} ${ADAPT_TRU_2}
+
+for s in "${SAMPLES[@]}"; do
+  if [[ -s ${CLEAN}/${s}_cat.fastq.gz ]]; then
+    echo "[SKIP] ${s}_cat.fastq.gz exists"
+    continue
+  fi
+  cat ${CLEAN}/${s}_clean_1.fastq.gz \
+      ${CLEAN}/${s}_clean_2.fastq.gz \
+      > ${CLEAN}/${s}_cat.fastq.gz
+done
+echo "[02_fastp_trim DONE] $(date)"
+
+#PBS -N kraken2_bracken
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=20:mem=512gb
+#PBS -l walltime=24:00:00
+#PBS -o kraken2_bracken.out
+#PBS -e kraken2_bracken.err
+source ~/.bashrc
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+DB=${ROOT}/shotgun_db/core_nt
+CLEAN=${BASE}/02_clean
+KR=${BASE}/03_1_kraken_core_nt
+SAMPLES=(M50 M53 M54 M73 M76 M83 M93 M94)
+mkdir -p ${KR}
+
+for s in "${SAMPLES[@]}"; do
+  if [[ -s ${KR}/${s}_kraken_report.txt ]]; then
+    echo "[SKIP] ${s}: Kraken2 report exists"
+    continue
+  fi
+  kraken2 --db ${DB} --paired \
+    ${CLEAN}/${s}_clean_1.fastq.gz \
+    ${CLEAN}/${s}_clean_2.fastq.gz \
+    --threads 20 \
+    --report ${KR}/${s}_kraken_report.txt \
+    --output /dev/null
+done
+
+for s in "${SAMPLES[@]}"; do
+  for level in S G F; do
+    if [[ -s ${KR}/${s}_bracken_${level}.tsv ]]; then
+      echo "[SKIP] ${s}: Bracken ${level} exists"
+      continue
+    fi
+    bracken -d ${DB} \
+      -i ${KR}/${s}_kraken_report.txt \
+      -o ${KR}/${s}_bracken_${level}.tsv \
+      -r 150 \
+      -l ${level} -t 10
+  done
+done
+
+BRACKEN_FILES=("${KR}"/*_bracken_S.tsv)
+combine_bracken_outputs.py \
+  --files "${BRACKEN_FILES[@]}" \
+  -o ${KR}/bracken_combined_species.tsv
+
+echo 'Sample,Bacterial%,Archaeal%,Fungal%,Plant%,Metazoa%,Viral%,Unclassified%,Arthropoda%,Insecta%' \
+  > ${KR}/kingdom_fractions.csv
+for s in "${SAMPLES[@]}"; do
+  awk -F'\t' -v s="${s}" '
+    BEGIN { n = split("2 2157 4751 33090 33208 10239 0 6656 50557", id, " ")
+            for (i = 1; i <= n; i++) pct[id[i]] = "0.00" }
+    ($5 in pct) { v = $1; gsub(/ /, "", v); pct[$5] = sprintf("%.2f", v) }
+    END { line = s; for (i = 1; i <= n; i++) line = line "," pct[id[i]]; print line }
+  ' ${KR}/${s}_kraken_report.txt >> ${KR}/kingdom_fractions.csv
+done
+cat ${KR}/kingdom_fractions.csv
+echo "[03_kraken2_bracken DONE] $(date)"
+
+#PBS -N metaphlan4
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=20:mem=32gb
+#PBS -l walltime=24:00:00
+#PBS -o metaphlan4.out
+#PBS -e metaphlan4.err
+source ~/.bashrc
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+MPADB=${ROOT}/shotgun_db/metaphlan
+CLEAN=${BASE}/02_clean
+MP=${BASE}/04_metaphlan
+SAMPLES=(M50 M53 M54 M73 M76 M83 M93 M94)
+mkdir -p ${MP}
+
+for s in "${SAMPLES[@]}"; do
+  if [[ -s ${MP}/${s}_metaphlan.tsv ]]; then
+    echo "[SKIP] ${s}: MetaPhlAn profile exists"
+    continue
+  fi
+  metaphlan ${CLEAN}/${s}_cat.fastq.gz \
+    --input_type fastq --index mpa_vJun23_CHOCOPhlAnSGB_202307 \
+    --nproc 20 \
+    --bowtie2db ${MPADB} \
+    -o ${MP}/${s}_metaphlan.tsv \
+    --bowtie2out ${MP}/${s}.bowtie2.bz2
+done
+
+merge_metaphlan_tables.py ${MP}/*_metaphlan.tsv \
+  > ${MP}/all_metaphlan_merged.tsv
+grep -E '(s__)' ${MP}/all_metaphlan_merged.tsv \
+  > ${MP}/all_metaphlan_species.tsv
+echo "[04_metaphlan4 DONE] $(date)"
+
+#PBS -N humann3
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=20:mem=64gb
+#PBS -l walltime=72:00:00
+#PBS -o humann3.out
+#PBS -e humann3.err
+module load anaconda2025/2025
+source ~/.bashrc
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+export TMPDIR=${ROOT}/tmp_humann
+mkdir -p ${TMPDIR}
+cd ${ROOT}
+BASE=${ROOT}/shotgun_results
+DB=${ROOT}/shotgun_db/humann
+CLEAN=${BASE}/02_clean
+MP=${BASE}/04_metaphlan
+HU=${BASE}/05_humann
+SAMPLES=(M50 M53 M54 M73 M76 M83 M93 M94)
+mkdir -p ${HU}
+
+for s in "${SAMPLES[@]}"; do
+  if [[ -s ${HU}/${s}/${s}_pathabundance.tsv ]]; then
+    echo "[SKIP] ${s}: HUMAnN output exists"
+    continue
+  fi
+  humann \
+    --input ${CLEAN}/${s}_cat.fastq.gz \
+    --output ${HU}/${s} \
+    --threads 20 \
+    --taxonomic-profile ${MP}/${s}_metaphlan.tsv \
+    --protein-database ${DB}/uniref \
+    --output-basename ${s} \
+    --bypass-nucleotide-search \
+    --remove-temp-output
+done
+
+for s in "${SAMPLES[@]}"; do
+  if [[ -s ${HU}/${s}/${s}_pathabundance_relab.tsv ]]; then
+    echo "[SKIP] ${s}: renormalised table exists"
+    continue
+  fi
+  humann_renorm_table \
+    --input ${HU}/${s}/${s}_pathabundance.tsv \
+    --output ${HU}/${s}/${s}_pathabundance_relab.tsv \
+    --units relab
+done
+
+humann_join_tables \
+  --input ${HU} \
+  --output ${HU}/all_pathabundance_relab.tsv \
+  --file_name pathabundance_relab \
+  --search-subdirectories
+humann_join_tables \
+  --input ${HU} \
+  --output ${HU}/all_genefamilies.tsv \
+  --file_name genefamilies \
+  --search-subdirectories
+humann_split_stratified_table \
+  --input ${HU}/all_pathabundance_relab.tsv \
+  --output ${HU}/
+rm -rf "${TMPDIR:?}"
+echo "[05_humann3 DONE] $(date)"
+
+#PBS -N megahit_coassembly
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=120:00:00
+#PBS -o megahit_coassembly.out
+#PBS -e megahit_coassembly.err
+module purge
+module load anaconda2025/2025
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+export TMPDIR=${ROOT}/tmp_megahit
+mkdir -p ${TMPDIR}
+cd ${ROOT}
+BASE=${ROOT}/shotgun_results
+CLEAN=${BASE}/02_clean
+ASM=${BASE}/06_assembly
+SAMPLES=(M50 M53 M54 M73 M76 M83 M93 M94)
+mkdir -p ${ASM}
+
+R1=$(printf "${CLEAN}/%s_clean_1.fastq.gz," "${SAMPLES[@]}"); R1=${R1%,}
+R2=$(printf "${CLEAN}/%s_clean_2.fastq.gz," "${SAMPLES[@]}"); R2=${R2%,}
+
+megahit \
+  -1 ${R1} \
+  -2 ${R2} \
+  --min-contig-len 1000 \
+  --k-min 27 --k-max 127 --k-step 10 \
+  --num-cpu-threads 40 \
+  --memory 107374182400 \
+  --tmp-dir ${TMPDIR} \
+  --out-dir ${ASM}/coassembly \
+  --out-prefix coassembly
+
+rm -rf "${TMPDIR:?}"
+echo "Contigs: $(grep -c '>' ${ASM}/coassembly/coassembly.contigs.fa)"
+echo "[06_coassembly DONE] $(date)"
+
+#PBS -N read_mapping
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -o read_mapping.out
+#PBS -e read_mapping.err
+module purge
+module load anaconda2025/2025
+module load samtools/1.21
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+CLEAN=${BASE}/02_clean
+ASM=${BASE}/06_assembly
+COV=${BASE}/07_coverage
+SAMPLES=(M50 M53 M54 M73 M76 M83 M93 M94)
+mkdir -p ${COV}
+
+awk '/^>/{ if (name != "" && length(seq) >= 1500) { print name; print seq }
+          name=$0; seq=""; next }
+     { seq = seq $0 }
+     END{ if (name != "" && length(seq) >= 1500) { print name; print seq } }' \
+  ${ASM}/coassembly/coassembly.contigs.fa > ${ASM}/coassembly/contigs_1500bp.fa
+echo "Contigs >= 1500 bp: $(grep -c '>' ${ASM}/coassembly/contigs_1500bp.fa)"
+CONTIGS=${ASM}/coassembly/contigs_1500bp.fa
+
+bowtie2-build --threads 40 ${CONTIGS} ${COV}/coassembly_idx
+
+for s in "${SAMPLES[@]}"; do
+  if [[ -s ${COV}/${s}.sorted.bam ]]; then
+    echo "[SKIP] ${s}: BAM exists"
+    continue
+  fi
+  bowtie2 -x ${COV}/coassembly_idx \
+    -1 ${CLEAN}/${s}_clean_1.fastq.gz \
+    -2 ${CLEAN}/${s}_clean_2.fastq.gz \
+    -p 40 --no-unal -S ${COV}/${s}.sam 2>${COV}/${s}_bowtie2.log
+  samtools sort -@ 8 -m 4G -o ${COV}/${s}.sorted.bam ${COV}/${s}.sam
+  samtools index ${COV}/${s}.sorted.bam
+  rm -f "${COV:?}/${s:?}.sam"
+  echo "${s}: $(grep 'overall alignment rate' ${COV}/${s}_bowtie2.log)"
+done
+echo "[07_read_mapping DONE] $(date)"
+
+#PBS -N binning
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=24:00:00
+#PBS -o binning.out
+#PBS -e binning.err
+module purge
+module load anaconda2025/2025
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+CONTIGS=${BASE}/06_assembly/coassembly/contigs_1500bp.fa
+COV=${BASE}/07_coverage
+BINS=${BASE}/08_bins
+mkdir -p ${BINS}/metabat2 ${BINS}/dastool
+
+if [[ -s ${BINS}/depth.txt ]]; then
+  echo "[SKIP] depth.txt exists"
+else
+  jgi_summarize_bam_contig_depths \
+    --outputDepth ${BINS}/depth.txt \
+    ${COV}/*.sorted.bam
+fi
+
+metabat2 \
+  -i ${CONTIGS} \
+  -a ${BINS}/depth.txt \
+  -o ${BINS}/metabat2/bin \
+  -t 40 -m 1500 \
+  --seed 123
+
+for b in ${BINS}/metabat2/*.fa; do
+  bin_name=$(basename ${b} .fa)
+  grep '^>' ${b} | sed 's/>//' | awk -v b=${bin_name} '{print $1"\t"b}'
+done > ${BINS}/metabat2_scaffolds2bin.tsv
+
+DAS_Tool \
+  -i ${BINS}/metabat2_scaffolds2bin.tsv \
+  -c ${CONTIGS} \
+  -l metabat2 \
+  --search_engine diamond \
+  --score_threshold 0.5 \
+  --write_bins \
+  -t 40 \
+  -o ${BINS}/dastool/DASTool
+echo "Bins: $(ls ${BINS}/dastool/DASTool_DASTool_bins/*.fa | wc -l)"
+echo "[08_binning DONE] $(date)"
+
+#PBS -N checkm2
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=64gb
+#PBS -l walltime=12:00:00
+#PBS -o checkm2.out
+#PBS -e checkm2.err
+module purge
+module load anaconda2025/2025
+eval "$(/usr/local/anaconda2025/bin/conda shell.bash hook)"
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+BINS=${BASE}/08_bins
+QA=${BASE}/09_mag_quality
+mkdir -p ${QA}
+
+checkm2 predict \
+  --input ${BINS}/dastool/DASTool_DASTool_bins \
+  --extension fa \
+  --output-directory ${QA}/checkm2 \
+  --database_path ${ROOT}/checkm2_db/CheckM2_database/uniref100.KO.1.dmnd \
+  --threads 40 \
+  --force
+
+echo "Medium-or-better (>= 50% complete, <= 10% contamination):"
+awk 'NR>1 && $2>=50 && $3<=10' ${QA}/checkm2/quality_report.tsv | wc -l
+echo "Near-complete (>= 90% complete, <= 5% contamination):"
+awk 'NR>1 && $2>=90 && $3<=5' ${QA}/checkm2/quality_report.tsv | wc -l
+echo "[09_checkm2 DONE] $(date)"
+
+#PBS -N annotation
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=48:00:00
+#PBS -o annotation.out
+#PBS -e annotation.err
+module load anaconda2025/2025
+source ~/.bashrc
+conda activate metagenomics
+set -euo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+CONTIGS=${BASE}/06_assembly/coassembly/contigs_1500bp.fa
+ANN=${BASE}/10_annotation
+EGGNOG_DB=${ROOT}/eggnog_db
+mkdir -p ${ANN}
+
+if [[ -s ${ANN}/coassembly_proteins.faa ]]; then
+  echo "[SKIP] Prodigal output exists"
+else
+  prodigal \
+    -i ${CONTIGS} \
+    -a ${ANN}/coassembly_proteins.faa \
+    -d ${ANN}/coassembly_genes.fna \
+    -f gff \
+    -o ${ANN}/coassembly.gff \
+    -p meta
+fi
+echo "Genes predicted: $(grep -c '>' ${ANN}/coassembly_proteins.faa)"
+
+if [[ -s ${ANN}/gene_catalogue_95.faa ]]; then
+  echo "[SKIP] CD-HIT output exists"
+else
+  cd-hit \
+    -i ${ANN}/coassembly_proteins.faa \
+    -o ${ANN}/gene_catalogue_95.faa \
+    -c 0.95 -aS 0.90 -G 0 -g 1 \
+    -T 40 -M 120000
+fi
+echo "Non-redundant genes: $(grep -c '>' ${ANN}/gene_catalogue_95.faa)"
+
+emapper.py \
+  -i ${ANN}/gene_catalogue_95.faa \
+  --output ${ANN}/eggnog_catalogue \
+  --data_dir ${EGGNOG_DB} \
+  --cpu 40
+echo "[10_annotation DONE] $(date)"
+
+#PBS -N coverm_gtdbtk
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=48:00:00
+#PBS -o coverm_gtdbtk.out
+#PBS -e coverm_gtdbtk.err
+source ~/.bashrc
+set -eo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+MAG_DIR=${BASE}/08_bins/dastool/DASTool_DASTool_bins
+COV_DIR=${BASE}/07_coverage
+MAG_COV=${BASE}/09_mag_quality/mag_coverage
+GTDB_OUT=${BASE}/09_mag_quality/gtdbtk
+CHECKM2_REPORT=${BASE}/09_mag_quality/checkm2/quality_report.tsv
+mkdir -p ${MAG_COV} ${GTDB_OUT}
+
+conda activate coverm
+coverm --version
+for m in relative_abundance mean covered_fraction; do
+  case ${m} in
+    relative_abundance) OUT=MAG_relative_abundance.tsv ;;
+    mean)               OUT=MAG_mean_coverage.tsv ;;
+    covered_fraction)   OUT=MAG_covered_fraction.tsv ;;
+  esac
+  coverm genome \
+    --bam-files ${COV_DIR}/*.sorted.bam \
+    --genome-fasta-directory ${MAG_DIR} -x fa \
+    --methods ${m} \
+    --threads 40 \
+    --output-file ${MAG_COV}/${OUT}
+done
+
+set +u
+conda deactivate
+conda activate gtdbtk2
+set -u
+export GTDBTK_DATA_PATH=${ROOT}/shotgun_db/release214
+
+awk 'NR>1 && $2>=50 && $3<=10 {print $1}' ${CHECKM2_REPORT} \
+  > ${GTDB_OUT}/hqmq_mag_names.txt
+echo "Medium-or-better bins to classify: $(wc -l < ${GTDB_OUT}/hqmq_mag_names.txt)"
+mkdir -p ${GTDB_OUT}/hqmq_bins
+while read mag_name; do
+  MAG_FILE="${MAG_DIR}/${mag_name}.fa"
+  if [ -f "${MAG_FILE}" ]; then
+    ln -sf ${MAG_FILE} ${GTDB_OUT}/hqmq_bins/${mag_name}.fa
+  else
+    echo "[WARNING] bin not found: ${MAG_FILE}"
+  fi
+done < ${GTDB_OUT}/hqmq_mag_names.txt
+
+gtdbtk classify_wf \
+  --genome_dir ${GTDB_OUT}/hqmq_bins \
+  --out_dir ${GTDB_OUT}/classify_wf_output \
+  --extension fa \
+  --cpus 40 \
+  --skip_ani_screen
+echo "[11_coverm_gtdbtk DONE] $(date)"
+
+#PBS -N mags_tree
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=8:mem=16gb
+#PBS -l walltime=02:00:00
+#PBS -o mags_tree.out
+#PBS -e mags_tree.err
+source ~/.bashrc
+set -eo pipefail
+set +u; conda activate gtdbtk2; set -u
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+export GTDBTK_DATA_PATH=${ROOT}/shotgun_db/release214
+
+BASE=${ROOT}/shotgun_results
+ALIGN=${BASE}/09_mag_quality/gtdbtk/classify_wf_output/align
+TREE_OUT=${BASE}/09_mag_quality/mags_tree
+mkdir -p ${TREE_OUT}
+
+MSA=${ALIGN}/gtdbtk.bac120.user_msa.fasta
+if [ ! -s ${MSA} ]; then
+  gunzip -c ${MSA}.gz > ${TREE_OUT}/user_msa.fasta
+  MSA=${TREE_OUT}/user_msa.fasta
+fi
+echo "Genomes in alignment: $(grep -c '>' ${MSA})"
+
+gtdbtk infer --msa_file ${MSA} --out_dir ${TREE_OUT} --cpus 8
+
+TREE=${TREE_OUT}/gtdbtk.unrooted.tree
+[ -s ${TREE} ] || TREE=$(find ${TREE_OUT} -maxdepth 2 -name '*.tree' | head -1)
+cp ${TREE} ${BASE}/09_mag_quality/mags_fasttree.tree
+echo "Tips: $(grep -o 'bin\.[0-9]*' ${BASE}/09_mag_quality/mags_fasttree.tree | sort -u | wc -l)"
+echo "[12_mags_tree DONE] $(date)"
+
+#PBS -N dbcan_fastani
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=48:00:00
+#PBS -o dbcan_fastani.out
+#PBS -e dbcan_fastani.err
+source ~/.bashrc
+set -eo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+GENE_CAT=${BASE}/10_annotation/gene_catalogue_95.faa
+MAG_DIR=${BASE}/09_mag_quality/gtdbtk/hqmq_bins
+DB_DIR=${ROOT}/shotgun_db/dbcan
+DBCAN_OUT=${BASE}/10_annotation/dbcan
+FASTANI_OUT=${BASE}/09_mag_quality/fastani_pairwise.txt
+BINS_LIST=${BASE}/09_mag_quality/hqmq_bins.txt
+mkdir -p ${DBCAN_OUT}
+
+set +u; conda deactivate; conda activate dbcan; set -u
+run_dbcan CAZyme_annotation \
+  --input_raw_data ${GENE_CAT} \
+  --mode protein \
+  --output_dir ${DBCAN_OUT} \
+  --db_dir ${DB_DIR} \
+  --threads 40 \
+  --methods diamond,hmm,dbCANsub \
+  --large \
+  --large_dbsub \
+  --memory_safety_factor 0.7 \
+  --memory_safety_factor_dbsub 0.7
+
+set +u; conda deactivate; conda activate metagenomics; set -u
+ls ${MAG_DIR}/*.fa > ${BINS_LIST}
+fastANI --ql ${BINS_LIST} --rl ${BINS_LIST} \
+  -t 40 -o ${FASTANI_OUT}
+echo "[13_dbcan_fastani DONE] $(date)"
+
+#PBS -N xeno_annotation
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=64gb
+#PBS -l walltime=24:00:00
+#PBS -o xeno_annotation.out
+#PBS -e xeno_annotation.err
+module load anaconda2025/2025
+source ~/.bashrc
+set -eo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+MAG_DIR=${BASE}/09_mag_quality/gtdbtk/hqmq_bins
+XENO_OUT=${BASE}/12_xenobiotic
+mkdir -p ${XENO_OUT}
+
+conda activate bakta
+BAKTA_DB=${ROOT}/shotgun_db/bakta/db-light
+for MAG_FILE in ${MAG_DIR}/*.fa; do
+  MAG=$(basename ${MAG_FILE} .fa)
+  if [ ! -s ${XENO_OUT}/bakta/${MAG}/${MAG}.faa ]; then
+    bakta --db ${BAKTA_DB} --output ${XENO_OUT}/bakta/${MAG} \
+      --prefix ${MAG} --threads 40 --keep-contig-headers --force ${MAG_FILE}
+  fi
+done
+conda deactivate
+
+conda activate kofamscan
+KOFAM_DB=${ROOT}/shotgun_db/kofam
+for MAG_FILE in ${MAG_DIR}/*.fa; do
+  MAG=$(basename ${MAG_FILE} .fa)
+  exec_annotation -f mapper \
+    -p ${KOFAM_DB}/profiles -k ${KOFAM_DB}/ko_list --cpu 40 \
+    -o ${XENO_OUT}/${MAG}_kofam.txt ${XENO_OUT}/bakta/${MAG}/${MAG}.faa
+done
+conda deactivate
+
+conda activate diamond
+BACMET_DB=${ROOT}/shotgun_db/bacmet/bacmet_exp.dmnd
+for MAG_FILE in ${MAG_DIR}/*.fa; do
+  MAG=$(basename ${MAG_FILE} .fa)
+  diamond blastp --query ${XENO_OUT}/bakta/${MAG}/${MAG}.faa --db ${BACMET_DB} \
+    --out ${XENO_OUT}/${MAG}_bacmet.tsv \
+    --outfmt 6 qseqid sseqid pident length evalue bitscore stitle \
+    --id 40 --query-cover 70 --evalue 1e-10 \
+    --max-target-seqs 1 --threads 40
+done
+conda deactivate
+echo "[14_xeno_annotation DONE] $(date)"
+
+#PBS -N mge_mobility
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=48:00:00
+#PBS -o mge_mobility.out
+#PBS -e mge_mobility.err
+module load anaconda2025/2025
+source ~/.bashrc
+set -eo pipefail
+ROOT="${ROOT:?set ROOT to the project directory on scratch}"
+
+BASE=${ROOT}/shotgun_results
+MAG_DIR=${BASE}/09_mag_quality/gtdbtk/hqmq_bins
+MGE_OUT=${BASE}/13_mobility
+mkdir -p ${MGE_OUT}/genomad ${MGE_OUT}/integron ${MGE_OUT}/isescan
+
+conda activate genomad
+GENOMAD_DB=${ROOT}/shotgun_db/genomad/genomad_db
+for MAG_FILE in ${MAG_DIR}/*.fa; do
+  MAG=$(basename ${MAG_FILE} .fa)
+  if [ ! -d ${MGE_OUT}/genomad/${MAG} ]; then
+    genomad end-to-end --cleanup --splits 4 --threads 40 \
+      ${MAG_FILE} ${MGE_OUT}/genomad/${MAG} ${GENOMAD_DB}
+  fi
+done
+conda deactivate
+
+conda activate integron_finder
+for MAG_FILE in ${MAG_DIR}/*.fa; do
+  MAG=$(basename ${MAG_FILE} .fa)
+  integron_finder ${MAG_FILE} --local-max --func-annot --cpu 40 \
+    --outdir ${MGE_OUT}/integron/${MAG}
+done
+conda deactivate
+
+conda activate isescan
+for MAG_FILE in ${MAG_DIR}/*.fa; do
+  MAG=$(basename ${MAG_FILE} .fa)
+  isescan.py --seqfile ${MAG_FILE} --output ${MGE_OUT}/isescan/${MAG} \
+    --nthread 40
+done
+conda deactivate
+echo "[15_mge_mobility DONE] $(date)"
+
+
+
+
+
+
 

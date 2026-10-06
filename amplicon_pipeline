@@ -1,1 +1,1043 @@
+#!/usr/bin/env python3
+
+01_trim_batch2_to_V4_and_merge.py
+
+import csv, hashlib, os, sys
+from collections import OrderedDict, defaultdict
+
+SRC, OUT = sys.argv[1], sys.argv[2]
+os.makedirs(OUT, exist_ok=True)
+P515 = "GTGCCAGCMGCCGCGGTAA"
+IUPAC = {"A": "A", "C": "C", "G": "G", "T": "T", "R": "AG", "Y": "CT", "S": "CG", "W": "AT", "K": "GT",
+         "M": "AC", "B": "CGT", "D": "AGT", "H": "ACT", "V": "ACG", "N": "ACGT"}
+MAXMM = 2
+report = []
+def say(*a):
+    line = " ".join(str(x) for x in a); print(line); report.append(line)
+
+def read_fasta(path):
+    seqs, name, buf = OrderedDict(), None, []
+    for line in open(path):
+        line = line.rstrip("\n\r")
+        if line.startswith(">"):
+            if name is not None: seqs[name] = "".join(buf)
+            name, buf = line[1:].split()[0], []
+        elif line:
+            buf.append(line.strip())
+    if name is not None: seqs[name] = "".join(buf)
+    return seqs
+
+def read_batch(i):
+    seqs = read_fasta(os.path.join(SRC, f"B{i}_Bact_feature.txt"))
+    with open(os.path.join(SRC, f"B{i}_Bact_featureTable.sample.total.absolute.txt")) as fh:
+        r = csv.reader(fh, delimiter="\t"); hdr = next(r)
+        assert hdr[0] == "#OTU_num" and hdr[-1] == "Taxonomy"
+        samples = hdr[1:-1]; rows = []
+        for row in r:
+            if row:
+                rows.append((row[0], seqs[row[0]].upper(), row[-1], [float(x) for x in row[1:-1]]))
+    assert len(rows) == len(seqs) and len({x[1] for x in rows}) == len(rows)
+    return samples, rows
+
+def merge(batches, tax_priority=None):
+    """Outer join on exact sequence, rows in first-appearance order. Taxonomy: first batch in which the
+    sequence appears, or, if tax_priority is given, the first batch in that order."""
+    all_samples = [s for _, samples, _ in batches for s in samples]
+    assert len(all_samples) == len(set(all_samples))
+    col = {s: i for i, s in enumerate(all_samples)}
+    table, taxby = OrderedDict(), defaultdict(dict)
+    for b, samples, rows in batches:
+        for asv, seq, tax, counts in rows:
+            if seq not in table:
+                table[seq] = [0.0] * len(all_samples)
+            taxby[seq].setdefault(b, tax)
+            for s, c in zip(samples, counts):
+                table[seq][col[s]] += c
+    order = tax_priority or [b for b, _, _ in batches]
+    out = OrderedDict()
+    for seq, counts in table.items():
+        first = next(b for b in (tax_priority or [b for b, _, _ in batches]) if b in taxby[seq]) \
+            if tax_priority else next(iter(taxby[seq]))
+        out[seq] = (taxby[seq][first], counts, first)
+    return all_samples, out
+
+def write_table(path, samples, table):
+    with open(path, "w", newline="") as f:
+        f.write("\t".join(["Sequence", "Taxonomy"] + samples) + "\n")
+        for seq, (tax, counts, _) in table.items():
+            assert all(c == int(c) for c in counts)
+            f.write("\t".join([seq, tax] + [str(int(c)) for c in counts]) + "\n")
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
+    return h.hexdigest()
+
+def find_515f(seq):
+    best = None
+    L = len(P515)
+    for i in range(0, len(seq) - L + 1):
+        mm = 0
+        for a, p in zip(seq[i:i + L], P515):
+            if a not in IUPAC[p]:
+                mm += 1
+                if mm > MAXMM: break
+        if mm <= MAXMM and (best is None or mm < best[1]):
+            best = (i, mm)
+            if mm == 0: break
+    return best
+
+say("# Batch-2 V3-V4 -> V4 trim and B1-B7 merge")
+batches = [(f"B{i}",) + read_batch(i) for i in range(1, 8)]
+for b, s, r in batches:
+    say(f"{b}: {len(s)} samples, {len(r)} ASVs")
+
+samples, tab0 = merge(batches)
+
+b2_samples, b2_rows = batches[1][1], batches[1][2]
+other_seqs = {seq for b, _, rows in batches if b != "B2" for _, seq, _, _ in rows}
+log, kept, dropped = [], [], []
+for asv, seq, tax, counts in b2_rows:
+    hit = find_515f(seq)
+    tot = sum(counts)
+    if hit is None:
+        dropped.append((asv, seq, tax, tot))
+        log.append([asv, len(seq), "", "", "", "dropped: no 515F site", int(tot), tax, ""])
+        continue
+    pos, mm = hit
+    v4 = seq[pos + len(P515):]
+    kept.append((asv, v4, tax, counts))
+    log.append([asv, len(seq), pos + 1, mm, len(v4), "trimmed", int(tot), tax, "yes" if v4 in other_seqs else "no"])
+
+coll = OrderedDict()
+for asv, v4, tax, counts in kept:
+    if v4 not in coll:
+        coll[v4] = [asv, tax, list(counts), sum(counts)]
+    else:
+        rec = coll[v4]
+        rec[2] = [a + b for a, b in zip(rec[2], counts)]
+        if sum(counts) > rec[3]:
+            rec[0], rec[1], rec[3] = asv, tax, sum(counts)
+b2_trim_rows = [(v[0], seq, v[1], v[2]) for seq, v in coll.items()]
+tot_b2 = sum(sum(c) for _, _, _, c in b2_rows)
+tot_drop = sum(d[3] for d in dropped)
+say(f"Batch-2 ASVs: {len(b2_rows)}; trimmed: {len(kept)}; dropped (no 515F within {MAXMM} mismatches): {len(dropped)} "
+    f"({tot_drop:.0f} of {tot_b2:.0f} batch-2 reads, {100 * tot_drop / tot_b2:.4f}%)")
+mmc = defaultdict(int)
+for r in log:
+    if r[5] == "trimmed": mmc[r[3]] += 1
+say("515F mismatches among trimmed ASVs: " + ", ".join(f"{k}: {v}" for k, v in sorted(mmc.items())))
+lens = sorted(len(s) for s in coll)
+say(f"Trimmed batch-2 sequences after collapsing identical ones: {len(coll)} (from {len(kept)}); "
+    f"length min/median/max {lens[0]}/{lens[len(lens) // 2]}/{lens[-1]} bp")
+shared = [s for s in coll if s in other_seqs]
+say(f"Trimmed batch-2 sequences identical to an ASV from another batch: {len(shared)}; "
+    f"they carry {100 * sum(sum(coll[s][2]) for s in shared) / (tot_b2 - tot_drop):.1f}% of the kept batch-2 reads")
+
+batches_t = [batches[0], ("B2", b2_samples, b2_trim_rows)] + batches[2:]
+samples_t, tab = merge(batches_t, tax_priority=["B1", "B3", "B4", "B5", "B6", "B7", "B2"])
+out_tab = os.path.join(OUT, "Merged_B1_to_B7_Sequence_Absolute_V4trim.txt")
+write_table(out_tab, samples_t, tab)
+say(f"Merged V4trim table: {len(tab)} sequences x {len(samples_t)} samples (untrimmed merge: {len(tab0)} x {len(samples)})")
+
+assert samples_t == samples
+col = {s: i for i, s in enumerate(samples)}
+for s in samples:
+    before = sum(v[1][col[s]] for v in tab0.values()); after = sum(v[1][col[s]] for v in tab.values())
+    if s in b2_samples:
+        lost = sum(d_counts for d_counts in (next(r[3] for r in b2_rows if r[0] == d[0])[b2_samples.index(s)] for d in dropped))
+        assert abs(before - lost - after) < 1e-6, s
+    else:
+        assert before == after, s
+say("Check: every non-batch-2 sample keeps exactly its read total; every batch-2 sample loses only the reads of dropped ASVs.")
+for b, smp, rows in batches:
+    if b == "B2": continue
+    for asv, seq, tax, counts in rows:
+        for s, c in zip(smp, counts):
+            assert tab[seq][1][col[s]] == c
+say("Check: every count from batches 1 and 3-7 is unchanged, ASV by ASV.")
+nb2_long = sum(1 for seq, v in tab.items() if len(seq) > 300 and any(v[1][col[s]] > 0 for s in b2_samples))
+say(f"Check: batch-2 sequences longer than 300 bp left in the table: {nb2_long}")
+assert nb2_long == 0
+src_b = defaultdict(int)
+for seq, (tax, counts, first) in tab.items():
+    src_b[first] += 1
+say("Taxonomy source (batch whose label is used): " + ", ".join(f"{k}: {v}" for k, v in sorted(src_b.items())))
+gen = lambda t: next((x for x in t.split(";") if x.startswith("g__")), "g__(none)")
+agree = dis = 0
+for asv, v4, tax, counts in kept:
+    if v4 in other_seqs:
+        if gen(tax) == gen(tab[v4][0]): agree += sum(counts)
+        else: dis += sum(counts)
+say(f"Genus label of batch-2 ASV vs the label the merged table carries for its V4 sequence (shared sequences, read-weighted): "
+    f"{100 * agree / (agree + dis):.1f}% agree")
+
+with open(os.path.join(OUT, "B2_trim_log.tsv"), "w", newline="") as f:
+    w = csv.writer(f, delimiter="\t")
+    w.writerow(["B2_ASV", "length_V3V4", "515F_start_1based", "515F_mismatches", "length_V4", "fate",
+                "B2_reads_total", "B2_taxonomy", "V4_sequence_also_in_other_batches"])
+    w.writerows(log)
+with open(os.path.join(OUT, "B2_dropped_no515F.fasta"), "w") as f:
+    for asv, seq, tax, tot in dropped:
+        f.write(f">{asv} reads={int(tot)} {tax}\n{seq}\n")
+say(f"Output md5: {md5(out_tab)}  Merged_B1_to_B7_Sequence_Absolute_V4trim.txt")
+open(os.path.join(OUT, "trim_and_merge_report.txt"), "w").write("\n".join(report) + "\n")
+
+#!/usr/bin/env python3
+
+02_make_picrust2_input.py
+
+import csv, hashlib, os, sys
+
+V4T, OUT = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.join(OUT, "picrust2"), exist_ok=True)
+log = []
+def say(*a):
+    s = " ".join(str(x) for x in a); print(s); log.append(s)
+
+def md5(p):
+    h = hashlib.md5()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
+    return h.hexdigest()
+
+def read_table(path):
+    with open(path) as fh:
+        r = csv.reader(fh, delimiter="\t"); hdr = next(r)
+        assert hdr[:2] == ["Sequence", "Taxonomy"]
+        return hdr, [row for row in r if row]
+
+hdr, rows = read_table(V4T)
+
+def picrust_files(header, rows, fasta, tsv):
+    with open(fasta, "w") as f_out, open(tsv, "w") as t_out:
+        w = csv.writer(t_out, delimiter="\t")
+        w.writerow(["#OTU_ID"] + header[2:])
+        for i, row in enumerate(rows, 1):
+            f_out.write(f">ASV_{i}\n{row[0]}\n")
+            w.writerow([f"ASV_{i}"] + row[2:])
+
+picrust_files(hdr, rows, os.path.join(OUT, "picrust2", "study_seqs_V4trim.fasta"),
+              os.path.join(OUT, "picrust2", "feature_table_V4trim.tsv"))
+say(f"PICRUSt2 V4trim input: {len(rows)} ASVs x {len(hdr) - 2} samples")
+for fn in ("study_seqs_V4trim.fasta", "feature_table_V4trim.tsv"):
+    say(f"md5 {md5(os.path.join(OUT, 'picrust2', fn))}  picrust2/{fn}")
+open(os.path.join(OUT, "picrust2", "input_manifest.txt"), "w").write("\n".join(log) + "\n")
+
+#!/bin/bash
+
+#PBS -N setup_V4trim
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=06:00:00
+#PBS -o setup_V4trim.out
+#PBS -e setup_V4trim.err
+source ~/.bashrc
+set -eo pipefail
+ROOT="${ROOT:?set ROOT to the amplicon run directory on scratch}"
+cd ${ROOT}
+exec > >(tee ${ROOT}/setup_V4trim.log) 2>&1
+REF=${ROOT}/reclassify/refdb
+Q2ENV=rachis-qiime2-2026.7
+Q2YML=https://raw.githubusercontent.com/qiime2/distributions/refs/heads/dev/2026.7/qiime2/released/rachis-qiime2-linux-64-conda.yml
+Q2CH=https://packages.qiime2.org/qiime2/2026.7/qiime2/released
+NODE_TMP="${TMPDIR:-/tmp}"
+if [ "$(df -Pk "${NODE_TMP}" | awk 'NR == 2 {print int($4 / 1048576)}')" -ge 10 ]; then
+  export TMPDIR="${NODE_TMP}/setup_V4trim.$$"
+else
+  export TMPDIR=${ROOT}/reclassify/tmp_setup
+  echo "[setup] WARNING: less than 10 GB free in ${NODE_TMP}; temporary files go to /scratch instead"
+fi
+mkdir -p ${REF} ${TMPDIR}
+echo "[setup] start $(date) on $(hostname); ROOT=${ROOT}; temporary files in ${TMPDIR}"
+
+env_prefix() { conda env list | awk -v n="$1" '$1 == n {print $NF}'; }
+
+if [ -z "$(env_prefix ${Q2ENV})" ]; then
+  echo "[setup] creating ${Q2ENV} from the official 2026.7 package list"
+  YML=${ROOT}/reclassify/rachis-qiime2-2026.7.yml
+  SPECS=${ROOT}/reclassify/rachis-qiime2-2026.7_packages.txt
+  curl -fsSL ${Q2YML} -o ${YML}
+  CH=$(awk '/^channels:/{c=1; next} /^[^- ]/{c=0} c && /^- /{print substr($0, 3)}' ${YML} | paste -sd' ' -)
+  if [ "${CH}" != "conda-forge bioconda ${Q2CH}" ]; then echo "[setup] STOP: unexpected channels: ${CH}"; exit 1; fi
+  awk '/^dependencies:/{d=1; next} /^[^- ]/{d=0} d && /^- /{print substr($0, 3)}' ${YML} > ${SPECS}
+  if [ "$(wc -l < ${SPECS})" -lt 500 ] || grep -qv '^[A-Za-z0-9_.-]*=[^= ]*$' ${SPECS}; then
+    echo "[setup] STOP: could not read the package list from ${YML}"; exit 1
+  fi
+  conda create -y -n ${Q2ENV} --override-channels -c conda-forge -c bioconda -c ${Q2CH} --file ${SPECS}
+fi
+if [ -z "$(env_prefix phylo_v4trim)" ]; then
+  echo "[setup] creating phylo_v4trim"
+  conda create -y -n phylo_v4trim --override-channels -c conda-forge -c bioconda mafft=7.525 iqtree=3.0.1
+fi
+if [ -z "$(env_prefix picrust2_251)" ]; then
+  echo "[setup] creating picrust2_251"
+  conda create -y -n picrust2_251 --override-channels -c conda-forge -c bioconda picrust2=2.5.1
+fi
+
+conda activate phylo_v4trim
+echo "[setup] MAFFT:    $(mafft --version 2>&1 | head -1)"
+IQ=$(command -v iqtree3 || command -v iqtree2 || command -v iqtree)
+echo "[setup] IQ-TREE:  $(${IQ} --version 2>&1 | grep -m1 -i 'IQ-TREE')"
+conda deactivate
+conda activate picrust2_251
+echo "[setup] PICRUSt2: $(picrust2_pipeline.py --version 2>&1 | head -1)"
+conda deactivate
+conda activate ${Q2ENV}
+qiime info > ${ROOT}/reclassify/qiime_info.txt 2>&1
+grep -iE '(release|version)[^:]*:' ${ROOT}/reclassify/qiime_info.txt | head -3 | sed 's/^/[setup] /' || true
+echo "[setup] $(grep -m1 -i 'rescript' ${ROOT}/reclassify/qiime_info.txt | sed 's/^ *//')"
+echo "[setup] $(grep -m1 -i 'feature-classifier' ${ROOT}/reclassify/qiime_info.txt | sed 's/^ *//')"
+echo "[setup] scikit-learn: $(python -c 'import sklearn; print(sklearn.__version__)')"
+
+cd ${REF}
+S=silva-138.2-ssu-nr99
+if [ -s ${S}-rna-seqs.qza ] && [ -s ${S}-tax.qza ]; then
+  echo "[setup] SILVA 138.2 already downloaded"
+else
+  echo "[setup] downloading SILVA 138.2 SSURef NR99 $(date)"
+  qiime rescript get-silva-data \
+    --p-version 138.2 \
+    --p-target SSURef_NR99 \
+    --p-no-include-species-labels \
+    --p-rank-propagation \
+    --o-silva-sequences ${S}-rna-seqs.partial.qza \
+    --o-silva-taxonomy ${S}-tax.partial.qza
+  qiime tools validate ${S}-rna-seqs.partial.qza
+  qiime tools validate ${S}-tax.partial.qza
+  mv ${S}-rna-seqs.partial.qza ${S}-rna-seqs.qza
+  mv ${S}-tax.partial.qza ${S}-tax.qza
+fi
+U=unite-10.0-2025-02-19-euk-99
+if [ -s ${U}-seqs.qza ] && [ -s ${U}-tax.qza ]; then
+  echo "[setup] UNITE 10.0 already downloaded"
+else
+  echo "[setup] downloading UNITE 10.0 (2025-02-19, all eukaryotes, 99%) $(date)"
+  qiime rescript get-unite-data \
+    --p-version 2025-02-19 \
+    --p-taxon-group eukaryotes \
+    --p-cluster-id 99 \
+    --p-no-singletons \
+    --o-sequences ${U}-seqs.partial.qza \
+    --o-taxonomy ${U}-tax.partial.qza
+  qiime tools validate ${U}-seqs.partial.qza
+  qiime tools validate ${U}-tax.partial.qza
+  mv ${U}-seqs.partial.qza ${U}-seqs.qza
+  mv ${U}-tax.partial.qza ${U}-tax.qza
+fi
+ls -l ${REF}
+rm -rf ${TMPDIR}
+echo "[setup DONE] $(date). Next: 04_reclassify.sh"
+
+#!/bin/bash
+#PBS -N reclassify_V4trim
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=24:00:00
+#PBS -o reclassify_V4trim.out
+#PBS -e reclassify_V4trim.err
+source ~/.bashrc
+set -eo pipefail
+set +u; conda activate rachis-qiime2-2026.7; set -u
+ROOT="${ROOT:?set ROOT to the amplicon run directory on scratch}"
+RC=${ROOT}/reclassify
+REF=${RC}/refdb
+CLF=${RC}/classifiers
+WK=${RC}/work
+OUT=${RC}/output
+NT=${NCPUS:-40}
+NODE_TMP="${TMPDIR:-/tmp}"
+if [ "$(df -Pk "${NODE_TMP}" | awk 'NR == 2 {print int($4 / 1048576)}')" -ge 30 ]; then
+  export TMPDIR="${NODE_TMP}/reclassify_V4trim.$$"
+else
+  export TMPDIR=${RC}/tmp
+  echo "[reclassify] WARNING: less than 30 GB free in ${NODE_TMP}; temporary files go to /scratch instead"
+fi
+export JOBLIB_TEMP_FOLDER=${TMPDIR}
+mkdir -p ${CLF} ${WK} ${OUT} ${TMPDIR}
+cd ${RC}
+step() { echo "[reclassify] $(date '+%F %T')  $*"; }
+nseq() {   # number of sequences inside a FeatureData[Sequence] or [RNASequence] .qza
+  python3 - "$1" <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+print(sum(sum(1 for l in z.open(n) if l.startswith(b">")) for n in z.namelist()
+          if "/data/" in n and n.endswith(".fasta")))
+PY
+}
+
+if [ -s ${OUT}/RECLASSIFY_DONE.txt ]; then
+  step "already finished (${OUT}/RECLASSIFY_DONE.txt exists); nothing to do"; exit 0
+fi
+S=silva-138.2-ssu-nr99
+U=unite-10.0-2025-02-19-euk-99
+for f in ${S}-rna-seqs.qza ${S}-tax.qza ${U}-seqs.qza ${U}-tax.qza; do
+  if [ ! -s ${REF}/${f} ]; then
+    step "STOP: ${REF}/${f} is missing. Run 03_setup_envs_databases.sh first."; exit 1
+  fi
+done
+step "$(qiime info 2>/dev/null | grep -iE '(release|version)[^:]*:' | grep -iv python | head -1); ${NT} CPUs; temporary files in ${TMPDIR}"
+
+W=${WK}/${S}
+if [ ! -s ${W}-seqs.qza ]; then
+  step "SILVA: reverse-transcribe RNA to DNA"
+  qiime rescript reverse-transcribe \
+    --i-rna-sequences ${REF}/${S}-rna-seqs.qza \
+    --o-dna-sequences ${W}-seqs.partial.qza
+  mv ${W}-seqs.partial.qza ${W}-seqs.qza
+fi
+if [ ! -s ${W}-seqs-cleaned.qza ]; then
+  step "SILVA: cull-seqs (5 or more ambiguous bases, or homopolymers of 8 or more)"
+  qiime rescript cull-seqs \
+    --i-sequences ${W}-seqs.qza \
+    --p-n-jobs ${NT} \
+    --o-clean-sequences ${W}-seqs-cleaned.partial.qza
+  mv ${W}-seqs-cleaned.partial.qza ${W}-seqs-cleaned.qza
+fi
+if [ ! -s ${W}-seqs-filt.qza ]; then
+  step "SILVA: length filter (Archaea >= 900, Bacteria >= 1200, Eukaryota >= 1400 bp)"
+  qiime rescript filter-seqs-length-by-taxon \
+    --i-sequences ${W}-seqs-cleaned.qza \
+    --i-taxonomy ${REF}/${S}-tax.qza \
+    --p-labels Archaea Bacteria Eukaryota \
+    --p-min-lens 900 1200 1400 \
+    --o-filtered-seqs ${W}-seqs-filt.partial.qza \
+    --o-discarded-seqs ${W}-seqs-discard.partial.qza
+  mv ${W}-seqs-discard.partial.qza ${W}-seqs-discard.qza
+  mv ${W}-seqs-filt.partial.qza ${W}-seqs-filt.qza
+fi
+if [ ! -s ${W}-seqs-derep.qza ]; then
+  step "SILVA: dereplicate (uniq)"
+  qiime rescript dereplicate \
+    --i-sequences ${W}-seqs-filt.qza \
+    --i-taxa ${REF}/${S}-tax.qza \
+    --p-mode uniq \
+    --o-dereplicated-sequences ${W}-seqs-derep.partial.qza \
+    --o-dereplicated-taxa ${W}-tax-derep.partial.qza
+  mv ${W}-tax-derep.partial.qza ${W}-tax-derep.qza
+  mv ${W}-seqs-derep.partial.qza ${W}-seqs-derep.qza
+fi
+if [ ! -s ${W}-515f-806r-seqs.qza ]; then
+  step "SILVA: extract the 515F/806R region (this study's primers)"
+  qiime feature-classifier extract-reads \
+    --i-sequences ${W}-seqs-derep.qza \
+    --p-f-primer GTGCCAGCMGCCGCGGTAA \
+    --p-r-primer GGACTACHVGGGTWTCTAAT \
+    --p-read-orientation forward \
+    --p-n-jobs ${NT} \
+    --o-reads ${W}-515f-806r-seqs.partial.qza \
+    --o-read-extraction-stats ${W}-515f-806r-extraction-stats.partial.qza
+  mv ${W}-515f-806r-extraction-stats.partial.qza ${W}-515f-806r-extraction-stats.qza
+  mv ${W}-515f-806r-seqs.partial.qza ${W}-515f-806r-seqs.qza
+fi
+if [ ! -s ${W}-515f-806r-seqs-derep.qza ]; then
+  step "SILVA: dereplicate the V4 region (uniq)"
+  qiime rescript dereplicate \
+    --i-sequences ${W}-515f-806r-seqs.qza \
+    --i-taxa ${W}-tax-derep.qza \
+    --p-mode uniq \
+    --o-dereplicated-sequences ${W}-515f-806r-seqs-derep.partial.qza \
+    --o-dereplicated-taxa ${W}-515f-806r-tax-derep.partial.qza
+  mv ${W}-515f-806r-tax-derep.partial.qza ${W}-515f-806r-tax-derep.qza
+  mv ${W}-515f-806r-seqs-derep.partial.qza ${W}-515f-806r-seqs-derep.qza
+fi
+if [ ! -s ${CLF}/${S}-515f-806r-classifier.qza ]; then
+  step "SILVA: train the naive Bayes classifier (single thread, about 1-3 h)"
+  qiime feature-classifier fit-classifier-naive-bayes \
+    --i-reference-reads ${W}-515f-806r-seqs-derep.qza \
+    --i-reference-taxonomy ${W}-515f-806r-tax-derep.qza \
+    --o-classifier ${CLF}/${S}-515f-806r-classifier.partial.qza
+  mv ${CLF}/${S}-515f-806r-classifier.partial.qza ${CLF}/${S}-515f-806r-classifier.qza
+fi
+
+
+if [ ! -s ${CLF}/${U}-classifier.qza ]; then
+  step "UNITE: train the naive Bayes classifier (single thread, about 1-3 h)"
+  qiime feature-classifier fit-classifier-naive-bayes \
+    --i-reference-reads ${REF}/${U}-seqs.qza \
+    --i-reference-taxonomy ${REF}/${U}-tax.qza \
+    --o-classifier ${CLF}/${U}-classifier.partial.qza
+  mv ${CLF}/${U}-classifier.partial.qza ${CLF}/${U}-classifier.qza
+fi
+
+{
+  echo "# Reference sequences at each step (counted inside the .qza files)"
+  echo "SILVA 138.2 SSURef NR99, downloaded:                   $(nseq ${REF}/${S}-rna-seqs.qza)"
+  echo "  after cull-seqs:                                      $(nseq ${W}-seqs-cleaned.qza)"
+  echo "  after length filter:                                  $(nseq ${W}-seqs-filt.qza)"
+  echo "  after dereplication:                                  $(nseq ${W}-seqs-derep.qza)"
+  echo "  515F/806R region extracted:                           $(nseq ${W}-515f-806r-seqs.qza)"
+  echo "  515F/806R region after dereplication (training set):  $(nseq ${W}-515f-806r-seqs-derep.qza)"
+  echo "UNITE 10.0 (2025-02-19) all eukaryotes 99% (training set): $(nseq ${REF}/${U}-seqs.qza)"
+  qiime info 2>/dev/null | grep -iE '(release|version)[^:]*:' | head -3 || true
+  echo "scikit-learn: $(python3 -c 'import sklearn; print(sklearn.__version__)')"
+} > ${OUT}/reference_db_summary.txt
+cat ${OUT}/reference_db_summary.txt
+
+step "writing the ASV sequences (bact_ASVs.fasta = the PICRUSt2 input, same ASV_ IDs)"
+python3 ${RC}/reclassify_tables.py prepare ${ROOT}
+for K in bact fungi; do
+  if [ ${K} = bact ]; then C=${CLF}/${S}-515f-806r-classifier.qza; T=${OUT}/bact_taxonomy_SILVA138.2.qza
+  else                     C=${CLF}/${U}-classifier.qza;           T=${OUT}/fungi_taxonomy_UNITE10.qza; fi
+  if [ ! -s ${WK}/${K}_ASVs.qza ]; then
+    qiime tools import --type 'FeatureData[Sequence]' \
+      --input-path ${WK}/${K}_ASVs.fasta --output-path ${WK}/${K}_ASVs.partial.qza
+    mv ${WK}/${K}_ASVs.partial.qza ${WK}/${K}_ASVs.qza
+  fi
+  if [ ! -s ${T} ]; then
+    step "classify-sklearn: ${K} ($(grep -c '>' ${WK}/${K}_ASVs.fasta) ASVs)"
+    qiime feature-classifier classify-sklearn \
+      --i-reads ${WK}/${K}_ASVs.qza \
+      --i-classifier ${C} \
+      --p-confidence 0.7 \
+      --p-read-orientation same \
+      --p-n-jobs 8 \
+      --p-reads-per-batch 1000 \
+      --o-classification ${T%.qza}.partial.qza
+    mv ${T%.qza}.partial.qza ${T}
+  fi
+  rm -rf ${WK}/${K}_taxonomy_export
+  qiime tools export --input-path ${T} --output-path ${WK}/${K}_taxonomy_export
+done
+
+step "relabelling the merged tables and writing the tree inputs"
+python3 ${RC}/reclassify_tables.py relabel ${ROOT}
+rm -rf ${TMPDIR}
+step "DONE. Next: 05_bact_tree.sh and 06_fungi_tree.sh"
+echo "[reclassify_V4trim DONE] $(date)"
+
+#!/bin/bash
+#PBS -N bact_tree_V4trim
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -o bact_tree_V4trim.out
+#PBS -e bact_tree_V4trim.err
+source ~/.bashrc
+set -eo pipefail
+set +u; conda activate phylo_v4trim; set -u
+ROOT="${ROOT:?set ROOT to the amplicon run directory on scratch}"
+exec > >(tee -a ${ROOT}/bact_tree_V4trim.log) 2>&1
+echo "[bact_tree] start $(date) on $(hostname)"
+MARK=${ROOT}/reclassify/output/RECLASSIFY_DONE.txt
+if [ ! -s ${MARK} ]; then
+  echo "[bact_tree] STOP: ${MARK} not found. 04_reclassify.sh has not finished; submit this job after it."
+  exit 1
+fi
+cd ${ROOT}/bact_tree
+NT=${NCPUS:-40}
+IQ=$(command -v iqtree3 || command -v iqtree2 || command -v iqtree)
+IN=bact_V4trim_for_tree.fasta
+ALN=bact_V4trim_aligned.fasta
+N_EXP=$(grep '^bact_tree_n=' ${MARK} | cut -d= -f2)
+MD5_EXP=$(grep '^bact_tree_md5=' ${MARK} | cut -d= -f2)
+MD5_IN=$(md5sum ${IN} | cut -d' ' -f1)
+N_IN=$(grep -c '>' ${IN})
+echo "[bact_tree] ASVs in input: ${N_IN} (recorded by 04_reclassify: ${N_EXP})"
+if [ "${MD5_IN}" != "${MD5_EXP}" ] || [ "${N_IN}" != "${N_EXP}" ]; then
+  echo "[bact_tree] STOP: ${IN} is not the file 04_reclassify.sh wrote."; exit 1
+fi
+if [ -e BACT_TREE_DONE.txt ]; then
+  if grep -qx "input_md5=${MD5_EXP}" BACT_TREE_DONE.txt; then
+    echo "[bact_tree] already finished for this input (BACT_TREE_DONE.txt); nothing to do"; exit 0
+  fi
+  echo "[bact_tree] STOP: BACT_TREE_DONE.txt belongs to an earlier input. Move the old alignment, IQ-TREE files and"
+  echo "        BACT_TREE_DONE.txt into a sub-folder, then qsub again."; exit 1
+fi
+
+if [ -s ${ALN} ]; then
+  if [ "$(cat ${ALN}.input_md5 2>/dev/null)" != "${MD5_IN}" ]; then
+    echo "[bact_tree] STOP: ${ALN} was made from a different input. Move it and the IQ-TREE files away, then qsub again."
+    exit 1
+  fi
+  echo "[bact_tree] reusing the finished alignment"
+else
+  mafft --auto --thread ${NT} ${IN} > ${ALN}.tmp
+  echo "${MD5_IN}" > ${ALN}.input_md5
+  mv ${ALN}.tmp ${ALN}
+fi
+echo "[bact_tree] sequences in alignment: $(grep -c '>' ${ALN})"
+
+if [ -s ${ALN}.iqtree ] && [ -s ${ALN}.treefile ]; then
+  echo "[bact_tree] IQ-TREE had already finished; reusing its tree"   # IQ-TREE writes both files only at the end
+else
+  ${IQ} -s ${ALN} -m TEST -T AUTO --threads-max ${NT} -seed 123
+fi
+
+test -s ${ALN}.treefile
+N_TIPS=$(grep -o 'seq_[0-9]*' ${ALN}.treefile | sort -u | wc -l)
+echo "[bact_tree] tips in tree: ${N_TIPS} (expected ${N_EXP})"
+if [ "${N_TIPS}" -ne "${N_EXP}" ]; then echo "[bact_tree] STOP: tip count differs"; exit 1; fi
+{ echo "tips=${N_TIPS}"; echo "input_md5=${MD5_IN}"; grep -m1 'Best-fit model' ${ALN}.iqtree || true
+  echo "finished=$(date)"; } > BACT_TREE_DONE.txt
+echo "[bact_tree_V4trim DONE] $(date)"
+
+#!/bin/bash
+#PBS -N fungi_tree
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=64gb
+#PBS -l walltime=48:00:00
+#PBS -o fungi_tree.out
+#PBS -e fungi_tree.err
+source ~/.bashrc
+set -eo pipefail
+set +u; conda activate phylo_v4trim; set -u
+ROOT="${ROOT:?set ROOT to the amplicon run directory on scratch}"
+exec > >(tee -a ${ROOT}/fungi_tree.log) 2>&1
+echo "[fungi_tree] start $(date) on $(hostname)"
+MARK=${ROOT}/reclassify/output/RECLASSIFY_DONE.txt
+if [ ! -s ${MARK} ]; then
+  echo "[fungi_tree] STOP: ${MARK} not found. 04_reclassify.sh has not finished; submit this job after it."
+  exit 1
+fi
+cd ${ROOT}/fungi_tree
+NT=${NCPUS:-40}
+IQ=$(command -v iqtree3 || command -v iqtree2 || command -v iqtree)
+IN=fungi_for_tree.fasta
+ALN=fungi_aligned.fasta
+N_EXP=$(grep '^fungi_tree_n=' ${MARK} | cut -d= -f2)
+MD5_EXP=$(grep '^fungi_tree_md5=' ${MARK} | cut -d= -f2)
+MD5_IN=$(md5sum ${IN} | cut -d' ' -f1)
+N_IN=$(grep -c '>' ${IN})
+echo "[fungi_tree] ASVs in input: ${N_IN} (recorded by 04_reclassify: ${N_EXP})"
+if [ "${MD5_IN}" != "${MD5_EXP}" ] || [ "${N_IN}" != "${N_EXP}" ]; then
+  echo "[fungi_tree] STOP: ${IN} is not the file 04_reclassify.sh wrote."; exit 1
+fi
+if [ -e FUNGI_TREE_DONE.txt ]; then
+  if grep -qx "input_md5=${MD5_EXP}" FUNGI_TREE_DONE.txt; then
+    echo "[fungi_tree] already finished for this input (FUNGI_TREE_DONE.txt); nothing to do"; exit 0
+  fi
+  echo "[fungi_tree] STOP: FUNGI_TREE_DONE.txt belongs to an earlier input. Move the old alignment, IQ-TREE files and"
+  echo "        FUNGI_TREE_DONE.txt into a sub-folder, then qsub again."; exit 1
+fi
+
+if [ -s ${ALN} ]; then
+  if [ "$(cat ${ALN}.input_md5 2>/dev/null)" != "${MD5_IN}" ]; then
+    echo "[fungi_tree] STOP: ${ALN} was made from a different input. Move it and the IQ-TREE files away, then qsub again."
+    exit 1
+  fi
+  echo "[fungi_tree] reusing the finished alignment"
+else
+  mafft --auto --thread ${NT} ${IN} > ${ALN}.tmp
+  echo "${MD5_IN}" > ${ALN}.input_md5
+  mv ${ALN}.tmp ${ALN}
+fi
+echo "[fungi_tree] sequences in alignment: $(grep -c '>' ${ALN})"
+
+if [ -s ${ALN}.iqtree ] && [ -s ${ALN}.treefile ]; then
+  echo "[fungi_tree] IQ-TREE had already finished; reusing its tree"   # IQ-TREE writes both files only at the end
+else
+  ${IQ} -s ${ALN} -m TEST -T AUTO --threads-max ${NT} -seed 123
+fi
+
+test -s ${ALN}.treefile
+N_TIPS=$(grep -o 'fseq_[0-9]*' ${ALN}.treefile | sort -u | wc -l)
+echo "[fungi_tree] tips in tree: ${N_TIPS} (expected ${N_EXP})"
+if [ "${N_TIPS}" -ne "${N_EXP}" ]; then echo "[fungi_tree] STOP: tip count differs"; exit 1; fi
+{ echo "tips=${N_TIPS}"; echo "input_md5=${MD5_IN}"; grep -m1 'Best-fit model' ${ALN}.iqtree || true
+  echo "finished=$(date)"; } > FUNGI_TREE_DONE.txt
+echo "[fungi_tree DONE] $(date)"
+
+#!/bin/bash
+#PBS -N picrust2_kept
+#PBS -P PROJECT_CODE
+#PBS -q QUEUE_NAME
+#PBS -l select=1:ncpus=40:mem=128gb
+#PBS -l walltime=48:00:00
+#PBS -o picrust2_kept.out
+#PBS -e picrust2_kept.err
+source ~/.bashrc
+set -eo pipefail
+set +u; conda activate picrust2_251; set -u
+ROOT="${ROOT:?set ROOT to the amplicon run directory on scratch}"
+cd ${ROOT}/picrust2
+exec > >(tee ${ROOT}/picrust2_kept.log) 2>&1
+echo "[picrust2_kept] start $(date) on $(hostname)"
+NT=${NCPUS:-40}
+OUT=picrust2_out_V4trim_kept
+MARK=${ROOT}/reclassify/output/RECLASSIFY_DONE.txt
+TREE_FA=${ROOT}/bact_tree/bact_V4trim_for_tree.fasta
+if [ -e PICRUST2_KEPT_DONE.txt ]; then
+  echo "[picrust2_kept] already finished (PICRUST2_KEPT_DONE.txt exists); nothing to do"; exit 0
+fi
+if [ -e ${OUT} ]; then
+  echo "[picrust2_kept] STOP: ${OUT} exists from an unfinished run; rename it (mv ${OUT} ${OUT}_failed1) and qsub again"
+  exit 1
+fi
+for f in ${MARK} ${TREE_FA} study_seqs_V4trim.fasta feature_table_V4trim.tsv; do
+  if [ ! -s ${f} ]; then echo "[picrust2_kept] STOP: ${f} not found"; exit 1; fi
+done
+N_EXP=$(grep '^bact_tree_n=' ${MARK} | cut -d= -f2)
+MD5_EXP=$(grep '^bact_tree_md5=' ${MARK} | cut -d= -f2)
+MD5_IN=$(md5sum ${TREE_FA} | cut -d' ' -f1)
+if [ "${MD5_IN}" != "${MD5_EXP}" ]; then
+  echo "[picrust2_kept] STOP: ${TREE_FA} is not the file 04_reclassify.sh wrote (md5 differs)"; exit 1
+fi
+
+python - "${TREE_FA}" "${N_EXP}" <<'PY'
+import sys
+tree_fa, n_exp = sys.argv[1], int(sys.argv[2])
+
+def read_fasta(path):
+    name, seq, out = None, [], []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith(">"):
+                if name is not None:
+                    out.append((name, "".join(seq)))
+                name, seq = line[1:].split()[0], []
+            elif line:
+                seq.append(line)
+    if name is not None:
+        out.append((name, "".join(seq)))
+    return out
+
+kept_seqs = {s.replace("-", "").upper() for _, s in read_fasta(tree_fa)}
+if len(kept_seqs) != n_exp:
+    sys.exit(f"[picrust2_kept] STOP: tree FASTA holds {len(kept_seqs)} distinct sequences, expected {n_exp}")
+study = read_fasta("study_seqs_V4trim.fasta")
+keep = [(n, s) for n, s in study if s.upper() in kept_seqs]
+if len(keep) != n_exp or len({s.upper() for _, s in keep}) != n_exp:
+    sys.exit(f"[picrust2_kept] STOP: {len(keep)} of the {n_exp} tree ASVs were found in study_seqs_V4trim.fasta")
+keep_ids = {n for n, _ in keep}
+with open("study_seqs_V4trim_kept.fasta.tmp", "w") as out:
+    for n, s in keep:
+        out.write(f">{n}\n{s}\n")
+n_rows, n_samples, total = 0, 0, 0
+with open("feature_table_V4trim.tsv") as fh, open("feature_table_V4trim_kept.tsv.tmp", "w") as out:
+    header = fh.readline()
+    n_samples = len(header.rstrip("\n").split("\t")) - 1
+    out.write(header)
+    sums = [0] * n_samples
+    for line in fh:
+        parts = line.rstrip("\n").split("\t")
+        if parts[0] in keep_ids:
+            if len(parts) != n_samples + 1:
+                sys.exit(f"[picrust2_kept] STOP: row {parts[0]} has {len(parts) - 1} values, expected {n_samples}")
+            out.write(line if line.endswith("\n") else line + "\n")
+            n_rows += 1
+            for i, v in enumerate(parts[1:]):
+                sums[i] += int(float(v))
+if n_rows != n_exp:
+    sys.exit(f"[picrust2_kept] STOP: {n_rows} of the {n_exp} kept ASVs were found in feature_table_V4trim.tsv")
+if min(sums) == 0:
+    sys.exit("[picrust2_kept] STOP: a sample has no reads left after filtering")
+print(f"[picrust2_kept] kept {n_rows} of {len(study)} ASVs; {n_samples} samples; "
+      f"{sum(sums)} reads; smallest sample {min(sums)} reads")
+PY
+mv study_seqs_V4trim_kept.fasta.tmp study_seqs_V4trim_kept.fasta
+mv feature_table_V4trim_kept.tsv.tmp feature_table_V4trim_kept.tsv
+N_FA=$(grep -c '>' study_seqs_V4trim_kept.fasta)
+N_TAB=$(($(wc -l < feature_table_V4trim_kept.tsv) - 1))
+echo "[picrust2_kept] sequences: ${N_FA}; table rows: ${N_TAB}; expected ${N_EXP}"
+if [ "${N_FA}" != "${N_EXP}" ] || [ "${N_TAB}" != "${N_EXP}" ]; then echo "[picrust2_kept] STOP: counts differ"; exit 1; fi
+
+NODE_TMP="${TMPDIR:-/tmp}"
+if [ "$(df -Pk "${NODE_TMP}" | awk 'NR == 2 {print int($4 / 1048576)}')" -ge 10 ]; then
+  export TMPDIR="${NODE_TMP}/picrust2_kept.$$"
+else
+  export TMPDIR=${ROOT}/picrust2/tmp_kept
+  echo "[picrust2_kept] WARNING: less than 10 GB free in ${NODE_TMP}; temporary files go to /scratch instead"
+fi
+mkdir -p ${TMPDIR}
+echo "[picrust2_kept] temporary files in ${TMPDIR}"
+
+picrust2_pipeline.py -s study_seqs_V4trim_kept.fasta -i feature_table_V4trim_kept.tsv -o ${OUT} \
+  -p ${NT} --stratified
+
+for f in KO_metagenome_out/pred_metagenome_unstrat.tsv.gz KO_metagenome_out/pred_metagenome_contrib.tsv.gz \
+         KO_metagenome_out/weighted_nsti.tsv.gz pathways_out/path_abun_unstrat.tsv.gz \
+         pathways_out/path_abun_contrib.tsv.gz; do
+  if [ -s ${OUT}/${f} ]; then echo "[picrust2_kept] OK      ${f}"; else echo "[picrust2_kept] MISSING ${f}"; exit 1; fi
+done
+rm -rf ${TMPDIR}
+{ echo "asvs=${N_EXP}"; echo "input_md5=${MD5_IN}"
+  echo "study_seqs_md5=$(md5sum study_seqs_V4trim_kept.fasta | cut -d' ' -f1)"
+  echo "feature_table_md5=$(md5sum feature_table_V4trim_kept.tsv | cut -d' ' -f1)"
+  echo "finished=$(date)"; } > PICRUST2_KEPT_DONE.txt
+echo "[picrust2_kept DONE] $(date)"
+
+#!/usr/bin/env python3
+import csv, hashlib, os, re, sys
+from collections import Counter, OrderedDict
+
+BACT_IN  = "Merged_B1_to_B7_Sequence_Absolute_V4trim.txt"
+FUNGI_IN = "Merged_B1_to_B7_Fungi_Sequence_Absolute.txt"
+BACT_OUT  = "Merged_B1_to_B7_Sequence_Absolute_V4trim_SILVA138.2.txt"
+FUNGI_OUT = "Merged_B1_to_B7_Fungi_Sequence_Absolute_UNITE10.txt"
+EXPECT = {BACT_IN:  ("d626f46dbd5121bf532d04e383962626", 54431, 107),
+          FUNGI_IN: ("c5b4609299e3dd097119fe9d034e441b", 16183, 156)}
+PICRUST_FASTA_MD5 = "fb78e55d4962605f1926dcce80a893bd"   # picrust2/study_seqs_V4trim.fasta
+RANK_PREFIX = "kpcofgs"
+
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def read_table(path):
+    """Merged table: Sequence, Taxonomy, then one column of absolute read counts per sample."""
+    name = os.path.basename(path)
+    want_md5, want_rows, want_samples = EXPECT[name]
+    got = md5(path)
+    if got != want_md5:
+        sys.exit(f"STOP: {name} is not the expected file (md5 {got}, expected {want_md5}).")
+    with open(path, newline="") as fh:
+        r = csv.reader(fh, delimiter="\t")
+        hdr = next(r)
+        rows = [row for row in r if row]
+    assert hdr[:2] == ["Sequence", "Taxonomy"], hdr[:2]
+    assert len(rows) == want_rows and len(hdr) - 2 == want_samples, (name, len(rows), len(hdr))
+    assert all(len(row) == len(hdr) for row in rows), name
+    seqs = [row[0] for row in rows]
+    assert len(set(seqs)) == len(seqs), f"{name}: duplicated sequences"
+    assert all(re.fullmatch(r"[ACGT]+", s) for s in seqs), f"{name}: sequence with a character other than ACGT"
+    return hdr, rows
+
+
+def ids_for(kind, n):
+    return [f"ASV_{i}" if kind == "bact" else f"fseq_{i}" for i in range(1, n + 1)]
+
+
+def write_fasta(path, ids, seqs):
+    with open(path, "w") as f:
+        for i, s in zip(ids, seqs):
+            f.write(f">{i}\n{s}\n")
+
+
+def read_fasta(path):
+    out, name, buf = OrderedDict(), None, []
+    for line in open(path):
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if name is not None:
+                out[name] = "".join(buf)
+            name, buf = line[1:].split()[0], []
+        elif line:
+            buf.append(line)
+    if name is not None:
+        out[name] = "".join(buf)
+    return out
+
+
+def provider_format(taxon):
+    """QIIME 2 label -> the layout of the provider's tables, which the R pipeline parses (split on ';', strip ^[kpcofgs]__).
+    SILVA writes the top rank as d__ (domain); the R pipeline expects k__. Ranks must be k,p,c,o,f,g,s in order,
+    optionally followed by UNITE's species-hypothesis code (sh__...) after a full seven-rank label."""
+    taxon = taxon.strip()
+    if taxon == "Unassigned":
+        return taxon
+    parts = [p.strip() for p in taxon.split(";")]
+    if parts[0].startswith("d__"):
+        parts[0] = "k__" + parts[0][3:]
+    ranks7, extra = parts[:7], parts[7:]
+    ok = all(p.startswith(RANK_PREFIX[i] + "__") for i, p in enumerate(ranks7))
+    ok = ok and (not extra or (len(extra) == 1 and len(parts) == 8 and extra[0].startswith("sh__")))
+    if not ok:
+        raise ValueError(f"unexpected taxonomy layout: {taxon!r}")
+    return ";".join(parts)
+
+
+def ranks(label):
+    """Same parsing as the R pipeline: separate(sep=';', fill='right') then remove ^[kpcofgs]__."""
+    parts = label.split(";")[:7]
+    parts += [None] * (7 - len(parts))
+    return [None if p is None else re.sub(r"^[kpcofgs]__", "", p) for p in parts]
+
+
+def prevalence(row):
+    return sum(1 for x in row[2:] if float(x) > 0)
+
+
+def reads(row):
+    return sum(float(x) for x in row[2:])
+
+
+def keep_bact(label, row):
+    k, p, c, o, f, g, s = ranks(label)
+    return k == "Bacteria" and o != "Chloroplast" and f != "Mitochondria" and prevalence(row) > 1
+
+
+def keep_fungi(label, row):
+    return ranks(label)[0] == "Fungi" and prevalence(row) > 1
+
+
+def prepare(root):
+    inp, wk = os.path.join(root, "reclassify", "input"), os.path.join(root, "reclassify", "work")
+    os.makedirs(wk, exist_ok=True)
+    for kind, fn in (("bact", BACT_IN), ("fungi", FUNGI_IN)):
+        hdr, rows = read_table(os.path.join(inp, fn))
+        out = os.path.join(wk, f"{kind}_ASVs.fasta")
+        write_fasta(out, ids_for(kind, len(rows)), [r[0] for r in rows])
+        print(f"[prepare] {kind}: {len(rows)} ASVs x {len(hdr) - 2} samples -> {out} (md5 {md5(out)})")
+    if md5(os.path.join(wk, "bact_ASVs.fasta")) != PICRUST_FASTA_MD5:
+        sys.exit("STOP: bact_ASVs.fasta differs from the PICRUSt2 input; the ASV_ IDs would not match.")
+    print("[prepare] bact_ASVs.fasta is identical to picrust2/study_seqs_V4trim.fasta (same ASV_ IDs)")
+
+
+def read_taxonomy(path, want_ids):
+    with open(path, newline="") as fh:
+        r = csv.reader(fh, delimiter="\t")
+        hdr = next(r)
+        assert hdr[:2] == ["Feature ID", "Taxon"], hdr
+        ci = hdr.index("Confidence") if "Confidence" in hdr else None
+        tax = {}
+        for row in r:
+            if not row or row[0].startswith("#"):
+                continue
+            assert row[0] not in tax, f"duplicated ID in {path}: {row[0]}"
+            tax[row[0]] = (row[1], row[ci] if ci is not None else "")
+    missing, extra = set(want_ids) - set(tax), set(tax) - set(want_ids)
+    assert not missing and not extra, f"{path}: {len(missing)} IDs missing, {len(extra)} unexpected"
+    return tax
+
+
+def pct(a, b):
+    return f"{100.0 * a / b:.2f}%" if b else "n/a"
+
+
+def relabel(root):
+    rc = os.path.join(root, "reclassify")
+    inp, wk, out = (os.path.join(rc, d) for d in ("input", "work", "output"))
+    os.makedirs(out, exist_ok=True)
+    rep = []
+    say = lambda s="": (print(s), rep.append(s))
+    marker = OrderedDict()
+
+    say("# Classification of the amplicon ASVs (QIIME 2 2026.7, classify-sklearn, confidence 0.7)")
+    say("# Bacteria: SILVA 138.2 SSURef NR99, trained on the 515F/806R region "
+        "(GTGCCAGCMGCCGCGGTAA / GGACTACHVGGGTWTCTAAT)")
+    say("# Fungi:    UNITE 10.0 (2025-02-19), all eukaryotes, 99% clusters, no singletons, full-length ITS")
+    say("# 'provider' = the label delivered with the merged table; 'assigned' = this classification.")
+
+    jobs = (("bact", BACT_IN, BACT_OUT, "SILVA138.2", keep_bact, "bact_tree", "bact_V4trim_for_tree.fasta", "seq_"),
+            ("fungi", FUNGI_IN, FUNGI_OUT, "UNITE10", keep_fungi, "fungi_tree", "fungi_for_tree.fasta", "fseq_"))
+    for kind, fin, fout, db, keep, tdir, tfile, tip in jobs:
+        hdr, rows = read_table(os.path.join(inp, fin))
+        ids = ids_for(kind, len(rows))
+        fasta = read_fasta(os.path.join(wk, f"{kind}_ASVs.fasta"))
+        assert list(fasta) == ids and all(fasta[i] == r[0] for i, r in zip(ids, rows)), \
+            f"{kind}_ASVs.fasta does not match the table row by row"
+        tax = read_taxonomy(os.path.join(wk, f"{kind}_taxonomy_export", "taxonomy.tsv"), ids)
+        new = [provider_format(tax[i][0]) for i in ids]
+        conf = [tax[i][1] for i in ids]
+        prov = [r[1] for r in rows]
+
+        # 1. relabelled merged table: identical to the input except for the Taxonomy column
+        path = os.path.join(out, fout)
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t", lineterminator="\n")
+            w.writerow(hdr)
+            for r, lab in zip(rows, new):
+                w.writerow([r[0], lab] + r[2:])
+        with open(path, newline="") as fh:
+            chk = list(csv.reader(fh, delimiter="\t"))
+        assert chk[0] == hdr and len(chk) - 1 == len(rows)
+        assert all(c[0] == r[0] and c[2:] == r[2:] and c[1] == lab for c, r, lab in zip(chk[1:], rows, new)), \
+            f"{fout}: sequence or count changed"
+
+        # 2. tree input with the pipeline filters (assigned labels); the count under the provider's labels beside it
+        sel = [(i, r[0]) for i, r, lab in zip(ids, rows, new) if keep(lab, r)]
+        n_prov = sum(1 for r in rows if keep(r[1], r))
+        os.makedirs(os.path.join(root, tdir), exist_ok=True)
+        tpath = os.path.join(root, tdir, tfile)
+        if kind == "bact":
+            tips = [(f"seq_{k}", s) for k, (_, s) in enumerate(sel, 1)]     # seq_1..seq_n; R joins by sequence
+        else:
+            tips = [(i, s) for i, s in sel]                                 # fseq_<row> = R Short_ID
+        write_fasta(tpath, [t for t, _ in tips], [s for _, s in tips])
+        in_tree = {i for i, _ in sel}
+
+        # 3. table of the provider's label beside the assigned label
+        cpath = os.path.join(out, f"{kind}_taxonomy_provider_vs_assigned.tsv")
+        with open(cpath, "w", newline="") as f:
+            w = csv.writer(f, delimiter="\t", lineterminator="\n")
+            w.writerow(["ID", "Total_reads", "Samples_present", "Provider_label", f"Assigned_label_{db}",
+                        "Confidence", "In_tree_input", "Sequence"])
+            for i, r, o, nlab, c in zip(ids, rows, prov, new, conf):
+                w.writerow([i, f"{reads(r):.0f}", prevalence(r), o, nlab, c, "yes" if i in in_tree else "no", r[0]])
+
+        # 4. report
+        tot = sum(reads(r) for r in rows)
+        say()
+        say(f"== {'BACTERIA' if kind == 'bact' else 'FUNGI'}: {len(rows)} ASVs, {len(hdr) - 2} samples, "
+            f"{tot:.0f} reads")
+        top = Counter()
+        topr = Counter()
+        for lab, r in zip(new, rows):
+            k = ranks(lab)[0]
+            top[k] += 1
+            topr[k] += reads(r)
+        say(f"Top rank ({'domain' if kind == 'bact' else 'kingdom'}), assigned labels: ASVs (share of reads)")
+        for k, n in top.most_common():
+            say(f"  {k:<28} {n:>7} ({pct(topr[k], tot)})")
+        focal = "Bacteria" if kind == "bact" else "Fungi"
+        fr = [(lab, r) for lab, r in zip(new, rows) if ranks(lab)[0] == focal]
+        ftot = sum(reads(r) for _, r in fr)
+        say(f"Depth of the assigned labels within {focal} (named rank, not empty): ASVs (share of {focal} reads)")
+        for j, rk in enumerate(("Phylum", "Class", "Order", "Family", "Genus"), 1):
+            ok = [(lab, r) for lab, r in fr if ranks(lab)[j] not in (None, "")]
+            say(f"  {rk:<8} {len(ok):>7} ({pct(sum(reads(r) for _, r in ok), ftot)})")
+        if kind == "bact":
+            chl = [r for lab, r in zip(new, rows) if ranks(lab)[3] == "Chloroplast"]
+            mit = [r for lab, r in zip(new, rows) if ranks(lab)[4] == "Mitochondria"]
+            say(f"Chloroplast (Order): {len(chl)} ASVs ({pct(sum(map(reads, chl)), tot)} of reads); "
+                f"Mitochondria (Family): {len(mit)} ASVs ({pct(sum(map(reads, mit)), tot)} of reads)")
+            other = [lab for lab in new if ("Chloroplast" in lab and ranks(lab)[3] != "Chloroplast")
+                     or ("Mitochondria" in lab and ranks(lab)[4] != "Mitochondria")]
+            say(f"Chloroplast or Mitochondria at a rank the R filter does not check: {len(other)}"
+                + ("" if not other else f"  WARNING, e.g. {other[0]}"))
+            rule = "Domain Bacteria, Order not Chloroplast, Family not Mitochondria, present in >1 sample"
+        else:
+            rule = "Kingdom Fungi, present in >1 sample"
+        say(f"Tree input ({rule}): {len(sel)} ASVs with the assigned labels; {n_prov} with the provider's labels")
+        named = lambda x: x not in (None, "")
+        say("Provider's label vs assigned label, all ASVs:")
+        for j, rk in ((1, "Phylum"), (5, "Genus")):
+            trip = [(ranks(o)[j], ranks(nl)[j], reads(r)) for o, nl, r in zip(prov, new, rows)]
+            both = [t for t in trip if named(t[0]) and named(t[1])]
+            same = [t for t in both if t[0] == t[1]]
+            say(f"  {rk:<6} named in both: {len(both)} ASVs, identical name: {len(same)} "
+                f"({pct(sum(t[2] for t in same), sum(t[2] for t in both))} of their reads); "
+                f"named only by the provider: {sum(1 for t in trip if named(t[0]) and not named(t[1]))}; "
+                f"named only here: {sum(1 for t in trip if named(t[1]) and not named(t[0]))}")
+        show = lambda x: x if named(x) else "(none)"
+        chg = Counter((show(ranks(o)[1]), show(ranks(nl)[1])) for o, nl in zip(prov, new)
+                      if show(ranks(o)[1]) != show(ranks(nl)[1]))
+        say("Most frequent phylum differences, provider -> assigned: ASVs (includes renames between database releases)")
+        for (a, b), n in chg.most_common(15):
+            say(f"  {a} -> {b}: {n}")
+        if not chg:
+            say("  none")
+        for p in (path, cpath, tpath):
+            say(f"md5 {md5(p)}  {os.path.relpath(p, root)}")
+        marker[f"{kind}_tree_fasta"] = os.path.relpath(tpath, root)
+        marker[f"{kind}_tree_n"] = str(len(sel))
+        marker[f"{kind}_tree_md5"] = md5(tpath)
+        marker[f"{kind}_table"] = os.path.relpath(path, root)
+        marker[f"{kind}_table_md5"] = md5(path)
+
+    with open(os.path.join(out, "reclassification_report.txt"), "w") as f:
+        f.write("\n".join(rep) + "\n")
+    tmp = os.path.join(out, "RECLASSIFY_DONE.txt.tmp")          # written last: the tree jobs wait for it
+    with open(tmp, "w") as f:
+        f.write("".join(f"{k}={v}\n" for k, v in marker.items()))
+    os.replace(tmp, os.path.join(out, "RECLASSIFY_DONE.txt"))
+    print("[relabel] done: reclassify/output/RECLASSIFY_DONE.txt written")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3 or sys.argv[1] not in ("prepare", "relabel"):
+        sys.exit(__doc__)
+    {"prepare": prepare, "relabel": relabel}[sys.argv[1]](os.path.abspath(sys.argv[2]))
 
